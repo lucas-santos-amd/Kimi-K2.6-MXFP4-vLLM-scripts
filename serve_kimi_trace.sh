@@ -1,7 +1,7 @@
 #!/bin/bash
 
 MODEL_PATH="${1:-/data/models/Kimi-K2.6-MXFP4}"
-TRACE_DIR="${TRACE_DIR:-/triton_dev/hhome/traces_fused_bmm_11032026}"
+TRACE_DIR="${TRACE_DIR:-/triton_dev/hhome/traces_mla_11102026}"
 # TRACE_DIR="${TRACE_DIR:-/triton_dev/hhome/traces_bf16_prefill_triton_bmm_10232026}"
 export VLLM_ROCM_USE_AITER=1
 export VLLM_ROCM_QUICK_REDUCE_QUANTIZATION=INT4

@@ -17,6 +17,7 @@ vllm serve $MODEL_PATH \
     --disable-uvicorn-access-log \
     --max-model-len 32768 \
     --max-num-seqs 512 \
-    --trust-remote-code
+    --trust-remote-code \
+	--port 8002
 
 # -cc.pass_config.fuse_allreduce_rms=False
