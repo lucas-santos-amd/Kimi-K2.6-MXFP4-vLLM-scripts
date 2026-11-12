@@ -425,6 +425,19 @@ def main():
     p.add_argument("--triton-heads", type=int, default=8, choices=(8, 16))
     p.add_argument("--kv-min", type=int, default=1024)
     p.add_argument("--kv-max", type=int, default=2048)
+    p.add_argument(
+        "--kv-mean",
+        type=int,
+        default=0,
+        help="if set, overrides --kv-min/--kv-max with "
+        "[mean*(1-r), mean*(1+r)], r = --kv-range-ratio",
+    )
+    p.add_argument(
+        "--kv-range-ratio",
+        type=float,
+        default=0.0,
+        help="spread around --kv-mean, as vllm bench --random-range-ratio",
+    )
     p.add_argument("--block-size", type=int, default=64)
     p.add_argument(
         "--max-seqlen-kv",
@@ -452,6 +465,9 @@ def main():
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--out", default="")
     args = p.parse_args()
+    if args.kv_mean:
+        args.kv_min = max(1, int(args.kv_mean * (1 - args.kv_range_ratio)))
+        args.kv_max = max(args.kv_min, int(args.kv_mean * (1 + args.kv_range_ratio)))
 
     inp = build_inputs(args)
     sm_scale = args.sm_scale
@@ -462,7 +478,8 @@ def main():
     mean_len = float(inp["seq_lens"].float().mean())
     print(
         f"B={args.batch} heads={args.heads} kv {args.kv_min}..{args.kv_max} "
-        f"(mean {mean_len:.0f}) block_size={args.block_size} layers={args.layers} "
+        f"(mean {mean_len:.0f}, max {int(inp['seq_lens'].max())}) "
+        f"block_size={args.block_size} layers={args.layers} "
         f"cache/layer {inp['num_blocks'] * args.block_size * D / 2**30:.2f} GiB "
         f"k_scale={args.k_scale} q_scale={args.q_scale}",
         flush=True,
