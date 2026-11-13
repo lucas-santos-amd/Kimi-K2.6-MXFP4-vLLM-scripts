@@ -19,6 +19,9 @@ time per call (what the trace rows report), profiled on eager calls.
 Sweeps (local monkeypatches, no AITER change):
 - --triton-sweep: num_warps x waves_per_eu x num_stages x segments.
 - --gluon-splits: NUM_KV_SPLITS values.
+- --gluon-split-meta: Gluon with the split rebalance (kv_split_info from
+  mla_gluon_split_metadata, AITER branch mla_gluon_split_rebalance), built once
+  outside the timed graph; the metadata kernel is timed alone.
 - --asm-sweep: kv_granularity x max_split_per_batch x fast_mode of the asm
   persistent metadata.
 
@@ -227,13 +230,21 @@ def make_triton(inp, args, sm_scale):
     return run, lambda: outs[0][:, ::rep].float()
 
 
-def make_gluon(inp, args, sm_scale):
+def make_gluon(inp, args, sm_scale, split_meta=False):
+    """split_meta: build the split rebalance partition once, outside the timed
+    graph (as vLLM would once per decode step), and share it across layers."""
     B = args.batch
     outs = [
         torch.empty(B, args.heads, KV_LORA, dtype=torch.bfloat16, device=DEV)
         for _ in inp["layers"]
     ]
     min_len = int(inp["seq_lens"].min())
+    extra = {}
+    if split_meta:
+        info = gluon_mod.mla_gluon_split_metadata(
+            inp["kv_indptr"], args.heads, FP8, use_2d_view=False
+        )
+        extra = dict(kv_split_info=info)
 
     def run():
         for layer, o in zip(inp["layers"], outs):
@@ -251,6 +262,7 @@ def make_gluon(inp, args, sm_scale):
                 use_2d_view=False,
                 kv_scale=args.k_scale,
                 min_kv_seq_len=min_len,
+                **extra,
             )
 
     return run, lambda: outs[0].float()
@@ -418,6 +430,30 @@ def gluon_splits(inp, args, sm_scale, refs):
     return results
 
 
+def gluon_split_meta(inp, args, sm_scale, refs):
+    """Gluon with a precomputed split rebalance partition, plus the metadata cost."""
+    results = []
+
+    def maker(i, a, s):
+        return make_gluon(i, a, s, split_meta=True)
+
+    try:
+        results.append(run_one("gluon", maker, inp, args, sm_scale, refs, "meta"))
+
+        def meta_run():
+            for _ in inp["layers"]:
+                gluon_mod.mla_gluon_split_metadata(
+                    inp["kv_indptr"], args.heads, FP8, use_2d_view=False
+                )
+
+        us, _ = time_graph(meta_run, args.layers, args.iters, args.reps)
+        print(f"gluon   split metadata (once per decode step)  {us:8.2f} us/call (graph)")
+        results.append(dict(kernel="gluon_split_metadata", config="meta", us_per_call=us))
+    except Exception as exc:  # noqa: BLE001
+        print(f"gluon   meta FAILED: {type(exc).__name__}: {exc}"[:200])
+    return results
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--batch", type=int, default=64)
@@ -461,6 +497,11 @@ def main():
     p.add_argument("--triton-sweep", action="store_true")
     p.add_argument("--asm-sweep", action="store_true")
     p.add_argument("--gluon-splits", type=int, nargs="*", default=[])
+    p.add_argument(
+        "--gluon-split-meta",
+        action="store_true",
+        help="Gluon with the split rebalance partition built once (mla_gluon_split_metadata)",
+    )
     p.add_argument("--profile", action="store_true")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--out", default="")
@@ -495,6 +536,8 @@ def main():
         results += asm_sweep(inp, args, sm_scale, refs)
     if args.gluon_splits:
         results += gluon_splits(inp, args, sm_scale, refs)
+    if args.gluon_split_meta:
+        results += gluon_split_meta(inp, args, sm_scale, refs)
     if args.out:
         with open(args.out, "w") as f:
             json.dump(
