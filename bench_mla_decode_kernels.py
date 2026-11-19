@@ -230,9 +230,10 @@ def make_triton(inp, args, sm_scale):
     return run, lambda: outs[0][:, ::rep].float()
 
 
-def make_gluon(inp, args, sm_scale, split_meta=False):
+def make_gluon(inp, args, sm_scale, split_meta=False, fp8_query=False):
     """split_meta: build the split rebalance partition once, outside the timed
-    graph (as vLLM would once per decode step), and share it across layers."""
+    graph (as vLLM would once per decode step), and share it across layers.
+    fp8_query: the fp8 query (q_fp8, q_scale) as asm gets it; fp8 QK and PV."""
     B = args.batch
     outs = [
         torch.empty(B, args.heads, KV_LORA, dtype=torch.bfloat16, device=DEV)
@@ -245,10 +246,13 @@ def make_gluon(inp, args, sm_scale, split_meta=False):
             inp["kv_indptr"], args.heads, FP8, use_2d_view=False
         )
         extra = dict(kv_split_info=info)
+    if fp8_query:
+        extra["q_scale"] = args.q_scale
+    q_key = "q_fp8" if fp8_query else "q_bf16"
 
     def run():
         for layer, o in zip(inp["layers"], outs):
-            q_nope, q_pe = torch.split(layer["q_bf16"], [KV_LORA, ROPE], dim=-1)
+            q_nope, q_pe = torch.split(layer[q_key], [KV_LORA, ROPE], dim=-1)
             gluon_mod.mla_gluon(
                 q_nope=q_nope,
                 q_pe=q_pe,
@@ -325,9 +329,12 @@ def run_one(name, maker, inp, args, sm_scale, refs, tag=""):
     us, _ = time_graph(run, args.layers, args.iters, args.reps)
     res = dict(kernel=name, config=tag, us_per_call=us)
     res.update(check(name, first_out(), refs["bf16" if name == "gluon" else "fp8"]))
+    res["max_abs_rel"] = res["max_abs"] / refs["scale"]
+    res["mean_abs_rel"] = res["mean_abs"] / refs["scale"]
     line = (
         f"{name:7s} {tag:48s} {us:8.2f} us/call (graph)  "
-        f"max|err| {res['max_abs']:.2e}  mean|err| {res['mean_abs']:.2e}"
+        f"max|err| {res['max_abs']:.2e}  mean|err| {res['mean_abs']:.2e}  "
+        f"(of max|ref|: {res['max_abs_rel']:.2%} / {res['mean_abs_rel']:.3%})"
     )
     if args.profile:
         k_us, rows = kernel_time(run, args.layers, args.iters)
@@ -437,8 +444,15 @@ def gluon_split_meta(inp, args, sm_scale, refs):
     def maker(i, a, s):
         return make_gluon(i, a, s, split_meta=True)
 
+    def maker_fp8(i, a, s):
+        return make_gluon(i, a, s, split_meta=True, fp8_query=True)
+
     try:
         results.append(run_one("gluon", maker, inp, args, sm_scale, refs, "meta"))
+        if "gluon_fp8" in args.kernels:
+            results.append(
+                run_one("gluon_fp8", maker_fp8, inp, args, sm_scale, refs, "meta")
+            )
 
         def meta_run():
             for _ in inp["layers"]:
@@ -516,6 +530,7 @@ def main():
         "fp8": reference(inp, inp["layers"][0], sm_scale, "fp8", args),
         "bf16": reference(inp, inp["layers"][0], sm_scale, "bf16", args),
     }
+    refs["scale"] = float(refs["fp8"].abs().max())
     mean_len = float(inp["seq_lens"].float().mean())
     print(
         f"B={args.batch} heads={args.heads} kv {args.kv_min}..{args.kv_max} "
@@ -525,7 +540,12 @@ def main():
         f"k_scale={args.k_scale} q_scale={args.q_scale}",
         flush=True,
     )
-    makers = dict(asm=make_asm, triton=make_triton, gluon=make_gluon)
+    makers = dict(
+        asm=make_asm,
+        triton=make_triton,
+        gluon=make_gluon,
+        gluon_fp8=lambda i, a, s: make_gluon(i, a, s, fp8_query=True),
+    )
     results = [
         run_one(k, makers[k], inp, args, sm_scale, refs, "default")
         for k in args.kernels
