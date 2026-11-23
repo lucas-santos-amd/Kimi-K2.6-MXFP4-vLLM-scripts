@@ -6,20 +6,22 @@
 # Gluon runs today's split (default) and the split rebalance with its partition
 # built once outside the timed graph (meta; its metadata kernel is timed alone).
 # Needs AITER branch mla_gluon_split_rebalance (gluon_fp8: mla_gluon_fp8_decode).
-# Usage: bash run_mla_microbench.sh [gpu] [heads] [kernels]
-#   heads 16 = DeepSeek-R1 TP8; kernels default "asm gluon", add gluon_fp8 for the fp8 query
+# Usage: bash run_mla_microbench.sh [gpu] [heads] [kernels] [batch]
+#   heads 16 = DeepSeek-R1 TP8; kernels default "asm gluon", add gluon_fp8 for the fp8 query;
+#   batch default 64 (the split rebalance applies below 256 requests for 8 / 16 heads)
 set -euo pipefail
 
 export ROCR_VISIBLE_DEVICES="${1:-7}"
 HEADS="${2:-8}"
 KERNELS="${3:-asm gluon}"
-OUT_DIR="mla_microbench_h${HEADS}_$(date +%Y%m%d_%H%M%S)"
+BATCH="${4:-64}"
+OUT_DIR="mla_microbench_h${HEADS}_b${BATCH}_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$OUT_DIR"
 
 for mean in 1024 8192; do
     for ratio in 0 0.8; do
         python bench_mla_decode_kernels.py \
-            --batch 64 --heads "$HEADS" --kv-mean "$mean" --kv-range-ratio "$ratio" \
+            --batch "$BATCH" --heads "$HEADS" --kv-mean "$mean" --kv-range-ratio "$ratio" \
             --kv-pool-gib 3 --kernels $KERNELS --gluon-split-meta \
             --profile --out "$OUT_DIR/kv${mean}_r${ratio}.json" 2>&1 \
             | grep -vE "queue-intercept|USDT|^\[aiter\]" | tee "$OUT_DIR/kv${mean}_r${ratio}.txt"
